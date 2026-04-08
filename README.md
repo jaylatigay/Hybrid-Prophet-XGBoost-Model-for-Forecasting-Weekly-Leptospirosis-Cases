@@ -185,7 +185,7 @@ ŷ_final = max(0, ŷ_base + r̂)
 ---
 
 ## 🧠 Explainable AI (SHAP Results)
-![SHAP visualization](graph/SHAP_visualization_(Intensity Correction and Seasonal Adjustment).png)
+![SHAP visualization](graphs/SHAP_visualization_(Intensity Correction and Seasonal Adjustment).png)
 
 To interpret the XGBoost residual corrections, **SHAP values** were used.
 
