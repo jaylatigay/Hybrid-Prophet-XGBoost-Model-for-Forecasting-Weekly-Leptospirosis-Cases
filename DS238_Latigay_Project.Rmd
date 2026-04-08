@@ -1,0 +1,483 @@
+
+---
+title: " Hybrid Forecasting (Prophet + XGBoost) of Philippine Leptospirosis Cases (2019–2023)"
+Project Overview: This project implements a Hybrid Residual Learning Model (Prophet + XGBoost) to forecast weekly Leptospirosis cases.
+
+Prophet models the global trend and seasonality (baseline).
+
+XGBoost models the residuals (errors) of Prophet to correct for non-linear outbreaks and intensity misses.
+
+Data Source: [Philippine Epidemiological Data](https://data.mendeley.com/datasets/v98325dpxv/1)
+
+---
+
+
+### 1. Setup & Dependencies
+Loads necessary libraries for time series analysis, machine learning, and visualization.
+
+```{r}
+# --- 1. SETUP & DEPENDENCIES ---
+library(tidyverse)  # Data manipulation & plotting
+library(zoo)        # Interpolation (na.approx)
+library(lubridate)  # Date handling
+library(prophet)    # Baseline time series forecasting
+library(xgboost)    # Gradient boosting (Residual correction)
+library(Metrics)    # Accuracy metrics (MAE, RMSE)
+library(Matrix)     # Sparse matrices for XGBoost
+library(patchwork)  # Combining plots (for better paper visuals)
+library(forecast)   # for SARIMA
+
+# Set global theme for all plots
+theme_set(theme_minimal())
+```
+
+
+### 2. Data Loading & Processing
+Reads the raw CSV, parses dates, and ensures a continuous weekly timeline (filling missing weeks with NA).
+```{r}
+# --- 2. LOAD & PROCESS DATES ---
+raw_data <- read_csv("Leptospirosis_WeeklyCasesPh_2019-2023.csv")
+
+clean_data <- raw_data %>%
+  mutate(
+    Date_Parsed = dmy(Date), 
+    Year = year(Date_Parsed), 
+    Week = week(Date_Parsed)
+  ) %>%
+  select(Year, Week, Cases, Date_Parsed) %>%
+  mutate(Cases = as.numeric(Cases)) %>%
+  
+  # Ensure every week (1-52) exists for every year (2019-2023)
+  complete(Year = 2019:2023, Week = 1:52, fill = list(Cases = NA)) %>%
+  
+  # Reconstruct Dates for the newly created empty rows
+  mutate(
+    Date_Parsed = if_else(
+      is.na(Date_Parsed),
+      ymd(paste0(Year, "-01-01")) + weeks(Week - 1),
+      Date_Parsed
+    )
+  ) %>%
+  
+  # Force Specific 2020 Gaps to NA (Lockdown/Typhoon Logic for Imputation)
+  mutate(Cases = replace(Cases, Year == 2020 & Week >= 11 & Week <= 26, NA)) %>%
+  mutate(Cases = replace(Cases, Year == 2020 & Week >= 35 & Week <= 38, NA)) %>%
+  mutate(Cases = replace(Cases, Year == 2020 & Week >= 43 & Week <= 45, NA))
+
+print(paste("Total Missing Dates:", sum(is.na(clean_data$Date_Parsed))))
+```
+
+### 3. Context-Aware Imputation
+Fills missing values using a layered strategy: Seasonal Average + Event Adjustment (Lockdown/Typhoon) + Linear Interpolation.
+
+```{r}
+# --- 3. CONTEXT-AWARE IMPUTATION ---
+
+# Step A: Calculate "Seasonal Baseline" (Excluding 2020 anomalies)
+seasonal_profile <- clean_data %>%
+  filter(Year != 2020) %>%
+  group_by(Week) %>%
+  summarise(Seasonal_Avg = mean(Cases, na.rm = TRUE), .groups = "drop")
+
+# Step B: Apply Imputation Logic
+imputed_data <- clean_data %>%
+  left_join(seasonal_profile, by = "Week") %>%
+  mutate(
+    Type = ifelse(is.na(Cases), "Imputed", "Observed"),
+    
+    Cases_Imputed = case_when(
+      # 1. COVID LOCKDOWN (2020) -> 50% of Normal Seasonal Baseline
+      Year == 2020 & Week >= 11 & Week <= 26 & is.na(Cases) ~ Seasonal_Avg * 0.5,
+      
+      # 2. TYPHOON SEASON (2020) -> 100% of Normal Seasonal Baseline
+      Year == 2020 & Week >= 43 & Week <= 45 & is.na(Cases) ~ Seasonal_Avg,
+      
+      # 3. Keep Observed Data
+      !is.na(Cases) ~ Cases,
+      
+      # 4. Remaining gaps -> NA (to be filled by linear interpolation)
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  # Linear Interpolation for tiny gaps
+  mutate(Cases_Imputed = na.approx(Cases_Imputed, na.rm = FALSE))
+
+# Final Prep for Modeling: Remove future empty rows (Nov-Dec 2023)
+model_data <- imputed_data %>%
+  select(ds = Date_Parsed, y = Cases_Imputed, Week, Year) %>%
+  filter(!is.na(y)) %>%  # Essential fix to prevent validation crashes
+  arrange(ds)
+
+print(paste("Data Ready. Total rows:", nrow(model_data)))
+```
+
+### 4. Model Configuration
+Sets training windows, XGBoost hyperparameters, and date indices for the rolling validation loop.
+
+```{r}
+# --- 4. CONFIGURATION ---
+
+# Training Parameters
+initial_train_weeks <- 115   # Starting window size
+prediction_horizon  <- 2     # Predict 2 weeks ahead
+slide_step          <- 16    # Test every ~4 months
+
+# XGBoost Parameters (Corrective Model)
+xgb_params <- list(
+  objective = "reg:squarederror",
+  max_depth = 1,        # Decision stumps (prevents overfitting on small data)
+  learning_rate = 0.35  # Aggressive correction
+)
+
+# Date Indexing
+unique_dates <- sort(unique(model_data$ds))
+start_index <- initial_train_weeks
+end_index   <- length(unique_dates) - prediction_horizon
+prophet_fold_data <- list() # Storage for cross-validation folds
+
+print(paste("Validation Range Indices:", start_index, "to", end_index))
+```
+
+### 5. Phase 1: Prophet Baseline & Residual Extraction
+Trains Prophet on rolling windows, generates forecasts, and calculates "Residuals" (errors) for XGBoost to learn.
+
+```{r}
+# --- 5. PHASE 1: PROPHET BASELINE ---
+print("Generating Baselines...")
+
+for (i in seq(start_index, end_index, by = slide_step)) {
+  
+  # Define Window
+  cutoff_date <- unique_dates[i]
+  cv_train <- model_data %>% filter(ds <= cutoff_date)
+  cv_test  <- model_data %>% filter(ds > cutoff_date & ds <= unique_dates[i + prediction_horizon])
+  
+  if(nrow(cv_test) < prediction_horizon) break 
+  
+  # Train Prophet
+  m <- prophet(cv_train, 
+               daily.seasonality = FALSE,
+               weekly.seasonality = TRUE, 
+               yearly.seasonality = TRUE,
+               seasonality.mode = 'multiplicative',
+               changepoint.prior.scale = 0.55, #best 0.55
+               seasonality.prior.scale = 5)           
+  
+  # Generate Forecasts
+  forecast_train <- predict(m, m$history) %>% select(ds = ds, yhat) %>% mutate(ds = as.Date(ds))
+  
+  future_test  <- make_future_dataframe(m, periods = nrow(cv_test), freq = "week")
+  forecast_test <- predict(m, future_test) %>% select(ds = ds, yhat) %>% mutate(ds = as.Date(ds)) %>%
+    filter(ds %in% cv_test$ds)
+  
+  # Calculate Residuals (Training Data)
+  # Residual = Actual - Predicted. This is what XGBoost will try to predict.
+  cv_train_prepared <- cv_train %>%
+    inner_join(forecast_train, by = "ds") %>%
+    mutate(Residual = y - yhat, WeekNum = isoweek(ds))
+  
+  # Prepare Test Data
+  cv_test_prepared <- cv_test %>%
+    inner_join(forecast_test, by = "ds") %>%
+    mutate(WeekNum = isoweek(ds))
+
+  # Store Fold Data
+  fold_id <- paste0("fold_", i)
+  prophet_fold_data[[fold_id]] <- list(train = cv_train_prepared, test = cv_test_prepared)
+  cat(".") 
+}
+print("Phase 1 Complete.")
+```
+
+
+### 6. Phase 2: Benchmarking (SARIMA + Seasonal Naive)
+This generates the standard baselines to compare against the Hybrid mode
+```{r}
+# --- 6. PHASE 2: BENCHMARKS (SARIMA & NAIVE) ---
+print("Generating Benchmarks (SARIMA & Seasonal Naive)...")
+
+benchmark_results_list <- list()
+
+for (fold_id in names(prophet_fold_data)) {
+  
+  # 1. Retrieve Data from Phase 1
+  fold_data <- prophet_fold_data[[fold_id]]
+  cv_train  <- fold_data$train
+  cv_test   <- fold_data$test
+  
+  # --- MODEL A: SEASONAL NAIVE (The "Floor") ---
+  # Prediction: Cases next week = Cases exactly 52 weeks ago
+  fold_snaive <- cv_test %>%
+    rowwise() %>%
+    mutate(
+      target_date_last_year = ds - weeks(52),
+      # Lookup historical value from the main clean dataset
+      SNaive_Forecast = model_data$y[model_data$ds == target_date_last_year][1]
+    ) %>%
+    ungroup() %>%
+    # Fill gaps (rare) with recent mean if last year's data is missing
+    mutate(SNaive_Forecast = ifelse(is.na(SNaive_Forecast), mean(cv_train$y), SNaive_Forecast))
+
+  # --- MODEL B: SARIMA (The "Standard") ---
+  # Create Time Series Object (Freq=52 for weekly data)
+  ts_train <- ts(cv_train$y, frequency = 52)
+  
+  # Train SARIMA (Stepwise=FALSE is slower but more accurate for publication)
+  fit_sarima <- auto.arima(ts_train, seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+  fcst_sarima <- forecast(fit_sarima, h = nrow(cv_test))
+  
+  # Combine Benchmark Results
+  fold_benchmarks <- fold_snaive %>%
+    mutate(
+      SARIMA_Forecast = as.numeric(fcst_sarima$mean),
+      SARIMA_Forecast = pmax(SARIMA_Forecast, 0) # Remove negatives
+    ) %>%
+    select(ds, SNaive_Forecast, SARIMA_Forecast)
+  
+  benchmark_results_list[[fold_id]] <- fold_benchmarks
+  cat(".")
+}
+
+benchmark_results_df <- bind_rows(benchmark_results_list)
+print("Benchmarking Complete.")
+```
+
+
+
+
+
+
+
+### 7. Phase 3: Hybrid Calibration & Merging
+ It runs XGBoost and then merges all model results (Prophet, XGBoost, SARIMA, SNaive) into one master table.
+
+```{r}
+# --- 7. PHASE 3: XGBOOST & MERGING ---
+print("Training XGBoost Corrections...")
+
+hybrid_results_list <- list()
+set.seed(123)
+
+for (fold_id in names(prophet_fold_data)) {
+
+  fold_data <- prophet_fold_data[[fold_id]]
+  cv_train <- fold_data$train
+  cv_test  <- fold_data$test
+
+  # XGBoost Matrix Creation
+  dtrain <- sparse.model.matrix(~ WeekNum + yhat, data = cv_train)
+  dtest  <- sparse.model.matrix(~ WeekNum + yhat, data = cv_test)
+  dtrain_xgb <- xgb.DMatrix(data = dtrain, label = cv_train$Residual)
+  dtest_xgb  <- xgb.DMatrix(data = dtest)
+
+  # Train & Predict
+  xgb_cv <- xgb.train(
+    params = list(objective = "reg:squarederror", max_depth = 1, eta = 0.35),
+    data = dtrain_xgb, nrounds = 500, verbose = 0
+  )
+  correction <- predict(xgb_cv, dtest_xgb)
+
+  # Combine Results
+  fold_result <- cv_test %>%
+    mutate(
+      Prophet_Only = yhat,
+      Hybrid_Forecast = pmax(yhat + correction, 0)
+    )
+  
+  hybrid_results_list[[fold_id]] <- fold_result
+}
+
+# --- MASTER MERGE ---
+# Join Hybrid results with Benchmark results
+rolling_results <- bind_rows(hybrid_results_list) %>%
+  left_join(benchmark_results_df, by = "ds") %>%
+  distinct(ds, .keep_all = TRUE)
+
+print("All Models Merged.")
+```
+
+
+### 8. Evaluation & Metrics
+This generates the "Scorecard" table comparing all 4 models.
+
+```{r}
+# --- 8. PUBLICATION EVALUATION ---
+
+# 1. Define Custom Metric Functions
+# SMAPE: Symmetric Mean Absolute Percentage Error (Good for seasonal data)
+smape_custom <- function(actual, pred) {
+  # Avoid division by zero by adding a tiny epsilon
+  mean(2 * abs(pred - actual) / (abs(actual) + abs(pred) + 1e-6)) * 100 
+}
+
+# Bias: Mean Error (Negative = Under-prediction, Positive = Over-prediction)
+bias_custom <- function(actual, pred) {
+  mean(pred - actual)
+}
+
+# 2. Scorecard Generator
+print_scorecard <- function(df) {
+  df %>%
+    summarise(
+      # --- MAE (Precision) ---
+      MAE_SNaive   = mae(y, SNaive_Forecast),
+      MAE_SARIMA   = mae(y, SARIMA_Forecast),
+      MAE_Prophet  = mae(y, Prophet_Only),
+      MAE_Hybrid   = mae(y, Hybrid_Forecast),
+      
+      # --- RMSE (Outbreak Sensitivity) ---
+      RMSE_SNaive  = rmse(y, SNaive_Forecast),
+      RMSE_SARIMA  = rmse(y, SARIMA_Forecast),
+      RMSE_Prophet = rmse(y, Prophet_Only),
+      RMSE_Hybrid  = rmse(y, Hybrid_Forecast),
+      
+      # --- SMAPE (Relative Error %) ---
+      SMAPE_SNaive   = smape_custom(y, SNaive_Forecast),
+      SMAPE_SARIMA   = smape_custom(y, SARIMA_Forecast),
+      SMAPE_Prophet  = smape_custom(y, Prophet_Only),
+      SMAPE_Hybrid   = smape_custom(y, Hybrid_Forecast),
+
+      # --- BIAS (Systematic Error) ---
+      Bias_SNaive   = bias_custom(y, SNaive_Forecast),
+      Bias_SARIMA   = bias_custom(y, SARIMA_Forecast),
+      Bias_Prophet  = bias_custom(y, Prophet_Only),
+      Bias_Hybrid   = bias_custom(y, Hybrid_Forecast)
+    ) %>%
+    pivot_longer(everything(), names_to = "Metric_Model", values_to = "Score") %>%
+    # Split "MAE_Hybrid" into "MAE" and "Hybrid"
+    separate(Metric_Model, into = c("Metric", "Model"), sep = "_") %>%
+    pivot_wider(names_from = Metric, values_from = Score) %>%
+    arrange(MAE) # Sort by best accuracy
+}
+
+# 3. Print Results
+print("--- OVERALL MODEL RANKING (2019-2023) ---")
+final_scorecard <- print_scorecard(rolling_results)
+knitr::kable(final_scorecard, caption = "Overall Performance Metrics")
+
+# Peak Analysis (High Cases Only)
+threshold <- quantile(rolling_results$y, 0.90)  
+print(paste("--- OUTBREAK DETECTION (Cases >", round(threshold,0), ") ---"))
+peak_scorecard <- rolling_results %>% filter(y >= threshold) %>% print_scorecard()
+knitr::kable(peak_scorecard, caption = "Performance During Outbreaks ( 90th percentile of cases)")
+```
+
+
+### 8. Comparative Visualization
+This plots the top 3 contenders to keep the chart readable.
+
+```{r}
+# --- 9. VISUALIZATION (ALL MODELS) ---
+plot_data <- rolling_results %>% distinct(ds, .keep_all = TRUE)
+
+
+ggplot(plot_data, aes(x = ds)) +
+  # 1. Actual Data (Grey Background)
+  geom_line(aes(y = y, color = "Observed Cases"), linewidth = 1.2, alpha = 0.3) +
+  
+  # 2. Baselines (Dashed/Dotted)
+  geom_line(aes(y = SNaive_Forecast, color = "SNaive"), linetype = "longdash", linewidth = 0.6) +
+  geom_line(aes(y = Prophet_Only, color = "Prophet"), linetype = "longdash", linewidth = 0.6) +
+  geom_line(aes(y = SARIMA_Forecast, color = "SARIMA"), linetype = "longdash", linewidth = 0.7) +
+  
+  # 3. Hybrid (The Proposed - Solid Red)
+  geom_line(aes(y = Hybrid_Forecast, color = "Hybrid (Prophet+XGB)"), linewidth = 0.8) +
+  
+  # Styling
+  scale_color_manual(values = c(
+    "Observed Cases" = "gray20", 
+    "SNaive" = "forestgreen",
+    "Prophet" = "purple",
+    "SARIMA" = "dodgerblue", 
+    "Hybrid (Prophet+XGB)" = "firebrick"
+  )) +
+  labs(
+    title = "Model Forecast Comparison: Hybrid vs. Baselines",
+    y = "Weekly Leptospirosis Cases",
+    x = "Date",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    plot.title = element_text(face = "bold"),
+    legend.title = element_blank()
+  )
+```
+
+### 9. Interpretability (SHAP & Components)
+Visualizes WHY the model works: Prophet's components + XGBoost's SHAP values.
+```{r}
+# --- 9. INTERPRETABILITY ---
+
+# A. Prophet Components
+# -----------------------
+m_final <- prophet(model_data, weekly.seasonality=TRUE, yearly.seasonality=TRUE)
+forecast_final <- predict(m_final, model_data)
+prophet_plots <- prophet_plot_components(m_final, forecast_final)
+
+# Combine using patchwork
+final_prophet_plot <- (prophet_plots[[1]] + labs(title = "A. Global Trend")) /
+                      (prophet_plots[[2]] + labs(title = "B. Weekly Seasonality")) /
+                      (prophet_plots[[3]] + labs(title = "C. Yearly Seasonality")) +
+                      plot_annotation(title = "Prophet Baseline Components")
+print(final_prophet_plot)
+
+# B. XGBoost SHAP Values (FINAL INTERPRETATION MODEL)
+# --------------------------------------------------
+
+# 1. Refit Prophet on FULL dataset (already used for interpretation)
+m_final <- prophet(
+  model_data,
+  weekly.seasonality = TRUE,
+  yearly.seasonality = TRUE,
+  seasonality.mode = "multiplicative"
+)
+
+forecast_final <- predict(m_final, model_data)
+
+# 2. Compute residuals on FULL dataset
+residual_data <- model_data %>%
+  left_join(
+    forecast_final %>% select(ds, yhat),
+    by = "ds"
+  ) %>%
+  mutate(
+    Residual = y - yhat,
+    WeekNum = isoweek(ds)
+  )
+
+# 3. Train ONE final XGBoost residual model (for SHAP only)
+dmat_full <- sparse.model.matrix(~ WeekNum + yhat, data = residual_data)
+dtrain_full <- xgb.DMatrix(data = dmat_full, label = residual_data$Residual)
+
+xgb_final <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    max_depth = 1,
+    eta = 0.35
+  ),
+  data = dtrain_full,
+  nrounds = 500,
+  verbose = 0
+)
+
+# 4. Compute SHAP values
+shap_contribs <- predict(
+  xgb_final,
+  dtrain_full,
+  predcontrib = TRUE
+)
+
+# 5. Plot SHAP
+par(oma = c(0, 0, 3, 0)) 
+xgb.plot.shap(
+  data = dmat_full,
+  shap_contrib = shap_contribs,
+  model = xgb_final,
+  top_n = 2
+)
+
+```
+
