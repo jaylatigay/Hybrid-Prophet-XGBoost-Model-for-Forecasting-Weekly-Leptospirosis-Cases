@@ -50,17 +50,9 @@ The dataset used in this study is publicly available from Mendeley Data:
 - Derived from:
   - Epidemiology and Disease Control Surveillance (EDCS)
   - Philippine Integrated Disease Surveillance and Response (PIDSR)
-- Includes multiple diseases such as:
-  - Leptospirosis
-  - Dengue
-  - Measles
-  - Rabies, and more
-
 - Used subset:
   - Weekly leptospirosis cases (2019–2023)
   - 260 observations
-
-This dataset is compiled from nationwide surveillance reports by the Department of Health (DOH) and is widely used for epidemiological modeling and forecasting. :contentReference[oaicite:0]{index=0}
 
 ---
 
@@ -126,25 +118,16 @@ ŷ_final = max(0, ŷ_base + r̂)
 
 ---
 
-### 4. Explainability (XAI)
-
-Used **SHAP (SHapley Additive Explanations)** to interpret:
-
-- When predictions are increased (underestimation)
-- When predictions are decreased (overestimation)
-
----
-
 ## 📈 Results
 
 ### 🔹 Overall Performance
 
-| Model | MAE | RMSE | SMAPE |
-|------|-----|------|-------|
-| **Hybrid (Prophet + XGBoost)** | **16.72** | **21.93** | **38.80** |
-| Prophet | 23.68 | 28.16 | 50.66 |
-| SARIMA | 31.58 | 45.42 | 51.71 |
-| SNaive | 64.18 | 97.56 | 93.65 |
+| Model | MAE | RMSE | SMAPE | Bias |
+|------|-----|------|-------|------|
+| **Hybrid (Prophet + XGBoost)** | **16.72** | **21.93** | **38.80** | **-0.72** |
+| Prophet | 23.68 | 28.16 | 50.66 | 1.05 |
+| SARIMA | 31.58 | 45.42 | 51.71 | -4.81 |
+| SNaive | 64.18 | 97.56 | 93.65 | -34.47 |
 
 ✅ Improvements over Prophet:
 - **MAE ↓ ~30%**
@@ -153,35 +136,117 @@ Used **SHAP (SHapley Additive Explanations)** to interpret:
 
 ---
 
-### 🔥 Performance During Outbreaks
+### 🔥 Performance During Outbreaks (90th Percentile)
 
-| Model | MAE (Outbreaks) |
-|------|----------------|
-| **Hybrid** | **7.74** |
-| SARIMA | 36.68 |
-| Prophet | 51.66 |
-| SNaive | 180.50 |
+| Model | MAE | RMSE | SMAPE | Bias |
+|------|-----|------|-------|------|
+| **Hybrid** | **7.74** | **7.90** | **2.82** | -1.56 |
+| SARIMA | 36.68 | 48.59 | 13.26 | -36.68 |
+| Prophet | 51.66 | 52.50 | 19.11 | -9.33 |
+| SNaive | 180.50 | 218.14 | 103.81 | -122.50 |
 
-👉 The Hybrid model is the **only model that improved during peak outbreaks**.
+👉 The Hybrid model is the **only model that improved during peak outbreaks**, showing strong robustness under high-intensity conditions.
 
 ---
 
-### 📊 Statistical Significance
+### 📊 Statistical Significance (Diebold-Mariano Test)
 
-- Diebold-Mariano test confirms:
-  - Hybrid model significantly outperforms all baselines  
-  - (p-values < 0.05)
+| Comparison | DM Statistic | p-value |
+|-----------|-------------|--------|
+| Hybrid vs Prophet | -1.8242 | 0.0429 |
+| Hybrid vs SARIMA | -2.2669 | 0.0184 |
+| Hybrid vs SNaive | -2.6524 | 0.0084 |
+
+✅ All results are **statistically significant (p < 0.05)**  
+→ Confirms that improvements are not due to chance.
+
+---
+
+### 📉 Residual Diagnostics & Stability
+
+- Hybrid model shows:
+  - Reduced **heavy-tail errors**
+  - Better alignment with normal residual distribution
+  - Lower variance across validation folds
+
+👉 Indicates:
+- Improved robustness
+- Better handling of extreme outbreak errors
+
+---
+
+### 📊 Forecast Behavior
+
+- Hybrid model:
+  - Closely tracks actual case counts
+  - Improves predictions over time via rolling validation
+  - Captures outbreak peaks more accurately than all baselines
+
+---
+
+## 🧠 Explainable AI (SHAP Results)
+
+To interpret the XGBoost residual corrections, **SHAP values** were used.
+
+### 🔹 Feature 1: Baseline Prediction (ŷ)
+
+- **ŷ < ~110**
+  - Minimal corrections  
+  → Prophet performs well in low-case regions
+
+- **ŷ ≈ 110–200**
+  - Negative SHAP values  
+  → Model reduces predictions (Prophet overestimates)
+
+- **ŷ > 200**
+  - Positive SHAP values  
+  → Model increases predictions (Prophet underestimates outbreaks)
+
+👉 Insight:
+- XGBoost **amplifies outbreak intensity** when needed
+
+---
+
+### 🔹 Feature 2: Week Number (Seasonality)
+
+- **Weeks 1–10**
+  - Negative SHAP values  
+  → Overestimation corrected downward
+
+- **Weeks 11–35**
+  - Near-zero SHAP values  
+  → Minimal correction needed
+
+- **Weeks 35–52**
+  - Increasing positive SHAP values  
+  → Strong upward corrections
+
+👉 Insight:
+- Model detects **late-season outbreak risk** (monsoon + flooding effects)
+
+---
+
+### 🔍 Key Interpretation
+
+- Positive SHAP → increase predicted cases  
+- Negative SHAP → decrease predicted cases  
+
+👉 The model:
+- Corrects **systematic bias in Prophet**
+- Learns **nonlinear environmental triggers**
+- Maintains **interpretability despite hybrid design**
 
 ---
 
 ## 🧠 Key Insights
 
 - Prophet captures **trend and seasonality**
-- XGBoost corrects **nonlinear residual errors**
-- Hybrid approach:
+- XGBoost captures **nonlinear outbreak behavior**
+- Hybrid model:
   - Reduces extreme forecast errors
   - Improves temporal stability
-  - Excels during outbreak periods
+  - Excels during outbreaks
+  - Remains interpretable via SHAP
 
 ---
 
